@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+import rospy
+import cv2
+from cv_bridge import CvBridge
+from sensor_msgs.msg import Image
+from std_msgs.msg import String
+from mr_voice.msg import Voice
+from geometry_msgs.msg import Twist
+from RobotChassis import RobotChassis
+import numpy as np
+from pcms.openvino_models import HumanPoseEstimation
+
+
+def callback_image(msg):
+    global _image
+    _image = CvBridge().imgmsg_to_cv2(msg, "bgr8")
+
+
+def callback_voice(msg):
+    global _voice
+    _voice_text = msg.text
+    _voice_direction = msg.direction
+
+
+def callback_depth(msg):
+    global _depth
+    tmp = CvBridge().imgmsg_to_cv2(msg, "passthrough")
+    _depth = np.array(tmp, dtype=np.float32)
+
+def say(text):
+    global _pub_speaker
+    if text is None or len(text) == 0:return
+    _pub_speaker.publish(text)
+    rospy.loginfo(text)
+    rospy.sleep(1)
+
+
+if __name__  == "__main__":
+    rospy.init_node("Receptionist")
+    rospy.loginfo("Receptionist started!")
+    
+    _image = None
+    rospy.Subscriber("/camera/color/image_raw", Image, callback_image)
+    rospy.wait_for_message("/camera/color/image_raw", Image)
+    
+    _depth = None
+    rospy.Subscriber("/camera/depth/image_raw", Image, callback_depth)
+    _voice = None
+    _voice_text = None
+    _voice_direction = None
+    rospy.Subscriber("/voice/text", Voice, callback_voice)
+    rospy.wait_for_message("/voice/text", Voice)
+
+    _pub_speaker = rospy.Publisher("/speaker/say", String, queue_size=10)
+    
+    pub_cmd = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
+    cmd_msg = Twist()
+    
+    chassis = RobotChassis()
+    
+    points = {"door":(1,2,3)}
+    dnn_pose = HumanPoseEstimation()
+    status = 0 # Executing Steps
+    name = ''
+    drink = ''
+    name_list = []
+    drink_list = []
+    divided_nums = 5
+    while not rospy.is_shutdown():
+        rospy.Rate(20).sleep()
+        if status == 0: # Wait for the guest
+            image = _image.copy()
+            poses = dnn_pose.forward()
+            if poses is not None:
+                chassis.move_to(*points["door"])
+                say("Dear guest, what is your name")
+                while _voice is None: continue
+                name = _voice_text.split(' ')[-1]
+                _voice = None
+                say("Ok. What do you like to drink")
+                while _voice is None:continue
+                drink = _voice_text.split(' ')[-1]
+                chassis.move_to(*points["chairs"])
+                status += 1
+        if status == 1:
+            print("I arrived the living room")
+            if len(name_list) == 0:
+                say(f"This is {name}. {name}'s favorite drink is {drink}")
+                say(f"{name}, please have a seat on the chair in front of me")
+            else:
+                image = _image.copy()
+                h,w,c = image.shape
+                width = w // divided_nums
+                for i in range(divided_nums):
+                    x1,x2 = width*i, width*i+width
+                    y1,y2 = 0, h-1
+                    image_copy = image[y1:y2][x1:x2]
+                    poses = dnn_pose.forward(image_copy)
+                    if poses is None:
