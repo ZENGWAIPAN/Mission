@@ -1,99 +1,201 @@
 #!/usr/bin/env python3
 import rospy
-import cv2
-from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
-from std_msgs.msg import String
-from mr_voice.msg import Voice
 from geometry_msgs.msg import Twist
+from cv_bridge import CvBridge
+import cv2
 from RobotChassis import RobotChassis
+from pcms.openvino_models import HumanPoseEstimation, Yolov8
+from mr_voice.msg import Voice
+from std_msgs.msg import String
+import yaml
+from sensor_msgs.msg import Imu
+from tf.transformations import euler_from_quaternion
 import numpy as np
-from pcms.openvino_models import HumanPoseEstimation
 
+
+class PID:
+    def __init__(self, p, i, d) -> None:
+        self.p = p
+        self.i = i
+        self.d = d
+        self.last_error = 0
+        self.errors = [0]
+        self.sum_error = 0
+        self.frame = 0
+    def control(self, err):
+        P = self.p * err
+        I = sum(self.errors) / len(self.errors)
+        D = self.d*(err - self.last_error)
+
+        self.last_error = err
+        self.frame += 1
+        self.sum_error -= self.errors[self.frame % 100]
+        self.errors[self.frame % 100] = err
+        self.sum_error += err
+
+        return P + I + D
+"""
+pid = PID(0.5, 0.1, 0.3)
+while True:
+    err = ...
+    power = pid.control(err)
+    pub.publish(power)
+"""
+def angular_PID(cx, tx):
+    e = tx - cx
+    p = 0.0015
+    z = p * e
+    if z > 0:
+        z = min(z, 0.25)
+        z = max(z, 0.05)
+    if z < 0:
+        z = max(z, -0.25)
+        z = min(z, -0.05)
+    return z
+
+# location
+task = {"door", "host", "seats"}
 
 def callback_image(msg):
-    global _image
-    _image = CvBridge().imgmsg_to_cv2(msg, "bgr8")
-
-
-def callback_voice(msg):
-    global _voice
-    _voice_text = msg.text
-    _voice_direction = msg.direction
-
+    global _frame
+    _frame = CvBridge().imgmsg_to_cv2(msg, "bgr8")
 
 def callback_depth(msg):
     global _depth
-    tmp = CvBridge().imgmsg_to_cv2(msg, "passthrough")
-    _depth = np.array(tmp, dtype=np.float32)
+    depth = CvBridge().imgmsg_to_cv2(msg, "passthrough")
 
-def say(text):
+def callback_voice(msg):
+    global _voice
+    _voice = msg
+
+def imu_callback(msg: Imu):
+        global imu
+        imu = msg
+
+def say(t):
     global _pub_speaker
-    if text is None or len(text) == 0:return
-    _pub_speaker.publish(text)
-    rospy.loginfo(text)
-    rospy.sleep(1)
+    if t is None or len(t) == 0:return
+    _pub_speaker.publish(t)
+    rospy.loginfo(t)
+    rospy.sleep(2)
+
+def text_to_ans(t):
+    name_list = []
+    possibility = []
+    for i,p in enumerate(possibility):
+        if t in p:
+            return name_list[i]
+
+def move(forward_speed: float = 0, turn_speed: float = 0):
+        global pub_cmd
+        msg = Twist()
+        msg.linear.x = forward_speed
+        msg.angular.z = turn_speed
+        pub_cmd.publish(msg)
 
 
-if __name__  == "__main__":
-    rospy.init_node("Receptionist")
-    rospy.loginfo("Receptionist started!")
+def turn_to(angle: float, speed: float):
+    global imu
+    max_speed = 1.82
+    limit_time = 8
+    start_time = rospy.get_time()
+    while True:
+        q = [
+            imu.orientation.x,
+            imu.orientation.y,
+            imu.orientation.z,
+            imu.orientation.w
+        ]
+        roll, pitch, yaw = euler_from_quaternion(q)
+        e = angle - yaw
+        if yaw < 0 and angle > 0:
+            cw = np.pi + yaw + np.pi - angle
+            aw = -yaw + angle
+            if cw < aw:
+                e = -cw
+        elif yaw > 0 and angle < 0:
+            cw = yaw - angle
+            aw = np.pi - yaw + np.pi + angle
+            if aw < cw:
+                e = aw
+        if abs(e) < 0.01 or rospy.get_time() - start_time > limit_time:
+            break
+        move(0.0, max_speed * speed * e)
+        rospy.Rate(20).sleep()
+    move(0.0, 0.0)
+
+def check(image):
+    global dnn_yolo
+    min_x = 999999
+    ans = -1
+    detections = dnn_yolo.forward(image)[0]["det"]
+    for i, detection in enumerate(detections):
+        x1, y1, x2, y2, score, class_id = map(int, detection)
+        if class_id != 56: continue
+        if x1 < min_x:
+            min_x, ans = x1, (x1+x2)//2
     
-    _image = None
-    rospy.Subscriber("/camera/color/image_raw", Image, callback_image)
-    rospy.wait_for_message("/camera/color/image_raw", Image)
-    
+if __name__ == "__main__":
+    rospy.init_node("task3")
+    rospy.loginfo("task3 started!")
+
+    _frame = None
+    rospy.Subscriber("/camera/rgb/image_raw", Image, callback_image)
+
     _depth = None
     rospy.Subscriber("/camera/depth/image_raw", Image, callback_depth)
+
     _voice = None
-    _voice_text = None
-    _voice_direction = None
     rospy.Subscriber("/voice/text", Voice, callback_voice)
-    rospy.wait_for_message("/voice/text", Voice)
 
     _pub_speaker = rospy.Publisher("/speaker/say", String, queue_size=10)
-    
-    pub_cmd = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
-    cmd_msg = Twist()
-    
+
     chassis = RobotChassis()
     
-    points = {"door":(1,2,3)}
-    dnn_pose = HumanPoseEstimation()
-    status = 0 # Executing Steps
-    name = ''
-    drink = ''
-    name_list = []
-    drink_list = []
-    divided_nums = 5
+    msg_cmd = Twist()
+    pub_cmd = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
+    dnn_pose = HumanPoseEstimation(device_name="GPU")
+
+    imu = None
+    rospy.Subscriber("/imu/data", Imu, imu_callback)
+
+    step = 1
+    name = None
+    drink = None
+    cnt = 0
+    guest = [['', ''],['', '']]
+
+    dnn_yolo = Yolov8(device_name="GPU")
     while not rospy.is_shutdown():
         rospy.Rate(20).sleep()
-        if status == 0: # Wait for the guest
-            image = _image.copy()
-            poses = dnn_pose.forward()
-            if poses is not None:
-                chassis.move_to(*points["door"])
-                say("Dear guest, what is your name")
-                while _voice is None: continue
-                name = _voice_text.split(' ')[-1]
-                _voice = None
-                say("Ok. What do you like to drink")
-                while _voice is None:continue
-                drink = _voice_text.split(' ')[-1]
-                chassis.move_to(*points["chairs"])
-                status += 1
-        if status == 1:
-            print("I arrived the living room")
-            if len(name_list) == 0:
-                say(f"This is {name}. {name}'s favorite drink is {drink}")
-                say(f"{name}, please have a seat on the chair in front of me")
-            else:
-                image = _image.copy()
-                h,w,c = image.shape
-                width = w // divided_nums
-                for i in range(divided_nums):
-                    x1,x2 = width*i, width*i+width
-                    y1,y2 = 0, h-1
-                    image_copy = image[y1:y2][x1:x2]
-                    poses = dnn_pose.forward(image_copy)
-                    if poses is None:
+        if _frame is None or imu is None: continue
+        if step == 1:
+            # detect a guest
+            h, w, c = _frame.shape
+            image = _frame.copy()[:,w//2:w,:]
+            poses = dnn_pose.forward(image)
+            if len(poses) == 0:continue
+            chassis.move_to(*task["door"])
+            step += 1
+        elif step == 2:
+            # get name and drink
+            say("Welcome to the party. I am a domestic robot, what is your name")
+            while _voice is None or "name" not in _voice.text: continue
+            name = text_to_ans(_voice.text[-1])
+            say("Nice to meet you. May I know your favorite drink?")
+            while _voice is None or "drink" not in _voice.text: continue
+            drink = _voice.text[-1]
+            guest[cnt][0], guest[cnt][1] = name, drink
+            say("Ok. Please stand behind me and follow me")
+            step += 1
+        elif step == 3:
+            chassis.move_to(*task["host"])
+            say(f"Dear master, this is {guest[cnt][0]}. {guest[cnt][0]} wants to order a cup of {guest[cnt][1]}")
+            chassis.move_to(*task["seats"])
+            step += 1
+        elif step == 4:
+            image = _frame.copy()
+            cx = check(image)
+            
+            
